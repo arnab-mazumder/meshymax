@@ -1,0 +1,28 @@
+{
+  "name": "meshy-auto-converter",
+  "version": "1.0.0",
+  "description": "Full Meshy Workspace Web Application with Automatic .meshy to .glb Conversion",
+  "type": "module",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "meshy",
+    "glb",
+    "converter",
+    "playwright",
+    "3d"
+  ],
+  "author": "Amal David",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "mime-types": "^2.1.35",
+    "multer": "^1.4.5-lts.1",
+    "playwright": "^1.44.0",
+    "ws": "^8.17.0"
+  }
+}

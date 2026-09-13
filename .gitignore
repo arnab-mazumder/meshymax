@@ -3,3 +3,4 @@ node_modules/
 *.meshy
 *.glb
 tests/fixtures/
+.meshy-session

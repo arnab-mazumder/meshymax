@@ -1,7 +1,6 @@
 import { chromium } from 'playwright';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { startFreshMeshySession } from './fresh-session.js';
 
 export class MeshyBrowserController {
   constructor(options = {}) {
@@ -132,51 +131,6 @@ export class MeshyBrowserController {
     }
   }
 
-  async launchFreshSession(onProgress) {
-    await this.closeBrowser();
-    this.setStatus('Starting fresh session');
-
-    try {
-      const session = await startFreshMeshySession({
-        headless: process.env.HEADLESS === 'true',
-        onProgress: (msg, detail) => {
-          if (onProgress) onProgress(msg, detail);
-        }
-      });
-
-      this.context = session.context;
-      this.page = session.page;
-
-      // Attach CDP session & network monitor
-      try {
-        this.cdpSession = await this.context.newCDPSession(this.page);
-        if (this.networkMonitor) {
-          if (typeof this.networkMonitor.attachCDP === 'function') {
-            await this.networkMonitor.attachCDP(this.cdpSession, this.page);
-          } else {
-            this.networkMonitor.attach(this.page);
-          }
-        }
-      } catch (cdpErr) {
-        console.warn('[BrowserController] Fresh session CDP attach warning:', cdpErr.message);
-      }
-
-      this.page.on('close', () => {
-        console.log('[BrowserController] Fresh session page closed.');
-        this.stopScreencast();
-        this.setStatus('Disconnected');
-      });
-
-      this.setStatus('Ready');
-      await this.startScreencast();
-      return session;
-    } catch (err) {
-      console.error('[BrowserController] Error in launchFreshSession:', err);
-      this.setStatus('Error');
-      throw err;
-    }
-  }
-
   async closeBrowser() {
     await this.stopScreencast();
     if (this.context) {
@@ -200,13 +154,14 @@ export class MeshyBrowserController {
     }
 
     try {
-      this.cdpSession.on('Page.screencastFrame', async ({ data, sessionId }) => {
+      this.cdpSession.on('Page.screencastFrame', async ({ data, sessionId, metadata }) => {
         try {
           await this.cdpSession.send('Page.screencastFrameAck', { sessionId });
         } catch {}
 
         if (this.onScreencastFrame) {
-          this.onScreencastFrame(data);
+          // Deliver as raw Buffer (binary) — eliminates base64 JSON overhead on the wire
+          this.onScreencastFrame(Buffer.from(data, 'base64'));
         }
 
         // Lightweight status check
@@ -220,8 +175,8 @@ export class MeshyBrowserController {
 
       await this.cdpSession.send('Page.startScreencast', {
         format: 'jpeg',
-        quality: 55,
-        everyNthFrame: 2
+        quality: 60,
+        everyNthFrame: 1   // send every frame for maximum fluidity
       });
       console.log('[BrowserController] CDP screencast active.');
     } catch (err) {

@@ -7,12 +7,13 @@
 // ── WEBSOCKET CONNECTION ──────────────────────────────────────────────────────
 let ws = null;
 let wsReconnectTimer = null;
-let autoConvertEnabled = true;
-let currentViewMode = 'dashboard'; // 'dashboard' | 'full'
+let autoConvertEnabled = false;
+let currentViewMode = 'full'; // Default to Full Website mode
 
 function connectWebSocket() {
   const wsUrl = `ws://${location.host}`;
   ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer'; // receive screencast frames as binary, not base64 text
 
   ws.onopen = () => {
     console.log('[WS] Connected');
@@ -20,6 +21,11 @@ function connectWebSocket() {
   };
 
   ws.onmessage = (event) => {
+    // Binary message = screencast frame (JPEG bytes)
+    if (event.data instanceof ArrayBuffer) {
+      updateScreencastBinary(event.data);
+      return;
+    }
     try {
       const data = JSON.parse(event.data);
       handleServerEvent(data);
@@ -51,9 +57,7 @@ function handleServerEvent(data) {
     case 'meshy_status':
       updateBrowserStatus(data.status);
       break;
-    case 'screencast_frame':
-      updateScreencast(data.frame);
-      break;
+    // 'screencast_frame' is no longer sent as JSON — handled as binary ArrayBuffer
     case 'model_detected':
       showToast(`🔍 Model detected: ${data.taskId}`, 'info');
       break;
@@ -88,15 +92,6 @@ function handleServerEvent(data) {
       autoConvertEnabled = data.enabled;
       document.getElementById('autoconvert-toggle').checked = data.enabled;
       updateFloatingMonitorStatus();
-      break;
-    case 'fresh_session_progress':
-      showToast(data.message, 'info', 3500);
-      break;
-    case 'fresh_session_success':
-      showToast(`✓ Meshy authenticated as ${data.email}! Chrome is open and ready.`, 'success', 8000);
-      break;
-    case 'fresh_session_error':
-      showToast(`✕ Fresh session error: ${data.error}`, 'error', 6000);
       break;
     default:
       break;
@@ -133,22 +128,47 @@ function updateBrowserStatus(status) {
   globalEl.className = `status-pill ${statusClass}`;
   labelEl.textContent = status;
 
-  const placeholder = document.getElementById('browser-placeholder');
-  const screencastImg = document.getElementById('screencast-img');
-
   if (status === 'Disconnected' || status === 'Error') {
+    const placeholder = document.getElementById('browser-placeholder');
+    const screencastImg = document.getElementById('screencast-img');
     placeholder.style.display = 'flex';
     screencastImg.style.display = 'none';
+    _screencastVisible = false; // reset visibility flag
   }
 }
 
+// ── SCREENCAST ────────────────────────────────────────────────────────────────
+let _screencastVisible = false; // track visibility without touching the DOM
+let _currentFrameUrl = null;    // track current Blob URL so we can revoke it
+
+/** Called for binary ArrayBuffer WebSocket messages (JPEG frame bytes) */
+function updateScreencastBinary(arrayBuffer) {
+  const img = document.getElementById('screencast-img');
+  const blob = new Blob([arrayBuffer], { type: 'image/jpeg' });
+  const url = URL.createObjectURL(blob);
+  img.src = url;
+
+  // Revoke the previous Blob URL once the new image loads to free memory
+  img.onload = () => {
+    if (_currentFrameUrl) URL.revokeObjectURL(_currentFrameUrl);
+    _currentFrameUrl = url;
+  };
+
+  if (!_screencastVisible) {
+    img.style.display = 'block';
+    document.getElementById('browser-placeholder').style.display = 'none';
+    _screencastVisible = true;
+  }
+}
+
+/** Legacy fallback for base64 frames (unused when binary WS is active) */
 function updateScreencast(base64Frame) {
   const img = document.getElementById('screencast-img');
-  const placeholder = document.getElementById('browser-placeholder');
   img.src = `data:image/jpeg;base64,${base64Frame}`;
-  if (img.style.display === 'none') {
+  if (!_screencastVisible) {
     img.style.display = 'block';
-    placeholder.style.display = 'none';
+    document.getElementById('browser-placeholder').style.display = 'none';
+    _screencastVisible = true;
   }
 }
 
@@ -274,26 +294,51 @@ function renderHistory() {
 
   emptyEl.style.display = 'none';
 
-  container.innerHTML = tasks.map(task => `
-    <div class="history-item" style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-        <div style="flex:1; min-width:0;">
-          <div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
-            ${statusIcon(task.status)}
-            <span class="task-id-tag" style="font-size:12px;">${task.filename || task.taskId + '.glb'}</span>
+  // Keyed update: add/update individual items instead of rebuilding the entire list.
+  // This avoids layout thrashing on every conversion_progress WebSocket event.
+  const existingIds = new Set(Array.from(container.children).map(el => el.dataset.taskId));
+  const incomingIds = new Set(tasks.map(t => t.taskId));
+
+  // Remove stale items
+  for (const id of existingIds) {
+    if (!incomingIds.has(id)) {
+      container.querySelector(`[data-task-id="${id}"]`)?.remove();
+    }
+  }
+
+  // Add or update each task
+  tasks.forEach(task => {
+    const html = `
+      <div class="history-item" style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+          <div style="flex:1; min-width:0;">
+            <div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
+              ${statusIcon(task.status)}
+              <span class="task-id-tag" style="font-size:12px;">${task.filename || task.taskId + '.glb'}</span>
+            </div>
+            <div style="font-size:10px; color:var(--text-dim);">
+              ${formatTime(task.timestamp)} · ${formatSize(task.sizeBytes)}
+              ${task.error ? `<span style="color:var(--status-error);"> · ${task.error}</span>` : ''}
+            </div>
           </div>
-          <div style="font-size:10px; color:var(--text-dim);">
-            ${formatTime(task.timestamp)} · ${formatSize(task.sizeBytes)}
-            ${task.error ? `<span style="color:var(--status-error);"> · ${task.error}</span>` : ''}
+          <div style="display:flex; gap:4px; flex-shrink:0;">
+            ${task.status === 'Completed' ? `<button class="btn btn-sm btn-primary" style="padding:2px 8px; font-size:10px;" onclick="downloadTask('${task.taskId}')">↓</button>` : ''}
+            <button class="btn btn-sm" style="padding:2px 6px; font-size:10px;" onclick="deleteTask('${task.taskId}')">✕</button>
           </div>
         </div>
-        <div style="display:flex; gap:4px; flex-shrink:0;">
-          ${task.status === 'Completed' ? `<button class="btn btn-sm btn-primary" style="padding:2px 8px; font-size:10px;" onclick="downloadTask('${task.taskId}')">↓</button>` : ''}
-          <button class="btn btn-sm" style="padding:2px 6px; font-size:10px;" onclick="deleteTask('${task.taskId}')">✕</button>
-        </div>
-      </div>
-    </div>
-  `).join('');
+      </div>`;
+
+    const existing = container.querySelector(`[data-task-id="${task.taskId}"]`);
+    if (existing) {
+      // Update only the content of the existing row wrapper — no DOM node removal/insertion
+      existing.innerHTML = html;
+    } else {
+      const wrapper = document.createElement('div');
+      wrapper.dataset.taskId = task.taskId;
+      wrapper.innerHTML = html;
+      container.appendChild(wrapper);
+    }
+  });
 }
 
 // ── DOWNLOAD ──────────────────────────────────────────────────────────────────
@@ -324,11 +369,6 @@ async function clearHistory() {
 }
 
 // ── BROWSER CONTROLS ──────────────────────────────────────────────────────────
-function startFreshSession() {
-  showToast('⚡ Starting Fresh Meshy Session via Emailnator…', 'info', 6000);
-  sendWsMessage({ type: 'fresh_session' });
-}
-
 function launchBrowser() {
   showToast('Launching Meshy browser…', 'info');
   sendWsMessage({ type: 'launch_browser' });
@@ -368,7 +408,13 @@ function setViewMode(mode) {
 document.addEventListener('DOMContentLoaded', () => {
   const screencastImg = document.getElementById('screencast-img');
   let isMouseDown = false;
+  let mouseDownPos = { x: 0, y: 0 };
   let lastMoveTime = 0;
+
+  // Prevent browser image dragging and touch scrolling interference
+  screencastImg.style.userSelect = 'none';
+  screencastImg.style.webkitUserDrag = 'none';
+  screencastImg.style.touchAction = 'none';
 
   function getBrowserCoords(e) {
     const rect = screencastImg.getBoundingClientRect();
@@ -385,14 +431,15 @@ document.addEventListener('DOMContentLoaded', () => {
   screencastImg.addEventListener('mousedown', (e) => {
     isMouseDown = true;
     const { x, y } = getBrowserCoords(e);
+    mouseDownPos = { x, y };
     const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
     sendWsMessage({ type: 'browser_interact', interaction: { type: 'mousedown', x, y, button } });
   });
 
-  window.addEventListener('mousemove', (e) => {
-    if (!isMouseDown) return;
+  screencastImg.addEventListener('mousemove', (e) => {
     const now = Date.now();
-    if (now - lastMoveTime < 25) return;
+    const interval = isMouseDown ? 16 : 33; // ~60Hz when dragging, ~30Hz when hovering
+    if (now - lastMoveTime < interval) return;
     lastMoveTime = now;
     const { x, y } = getBrowserCoords(e);
     sendWsMessage({ type: 'browser_interact', interaction: { type: 'mousemove', x, y } });
@@ -403,7 +450,14 @@ document.addEventListener('DOMContentLoaded', () => {
       isMouseDown = false;
       const { x, y } = getBrowserCoords(e);
       const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
-      sendWsMessage({ type: 'browser_interact', interaction: { type: 'mouseup', x, y, button } });
+      const dist = Math.hypot(x - mouseDownPos.x, y - mouseDownPos.y);
+      if (dist < 6) {
+        // Precise click for UI controls, checkboxes, CAPTCHAs & inputs
+        sendWsMessage({ type: 'browser_interact', interaction: { type: 'click', x, y, button } });
+      } else {
+        // Drag end for 3D view orbit / panning
+        sendWsMessage({ type: 'browser_interact', interaction: { type: 'mouseup', x, y, button } });
+      }
     }
   });
 
@@ -452,10 +506,8 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('autoconvert-toggle').checked = autoConvertEnabled;
   }
 
-  const savedViewMode = localStorage.getItem('meshy-view-mode');
-  if (savedViewMode) {
-    setViewMode(savedViewMode);
-  }
+  const savedViewMode = localStorage.getItem('meshy-view-mode') || 'full';
+  setViewMode(savedViewMode);
 
   // Button wiring
   document.getElementById('btn-launch').onclick = launchBrowser;

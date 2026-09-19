@@ -110,6 +110,17 @@ export class ConverterService {
     });
   }
 
+  _upsertHistory(taskState) {
+    const historyItem = { ...taskState };
+    const existingIdx = this.history.findIndex(h => h.taskId === taskState.taskId);
+    if (existingIdx >= 0) {
+      this.history[existingIdx] = historyItem;
+    } else {
+      this.history.unshift(historyItem);
+    }
+    return historyItem;
+  }
+
   /**
    * Processes binary meshy data and converts to GLB.
    * 
@@ -161,14 +172,7 @@ export class ConverterService {
       taskState.progress = 100;
       taskState.sizeBytes = glbBuffer.length;
 
-      const historyItem = { ...taskState };
-      const existingIdx = this.history.findIndex(h => h.taskId === taskId);
-      if (existingIdx >= 0) {
-        this.history[existingIdx] = historyItem;
-      } else {
-        this.history.unshift(historyItem);
-      }
-
+      const historyItem = this._upsertHistory(taskState);
       this._emitStateChange({ type: 'conversion_completed', task: historyItem, filename });
 
       return glbBuffer;
@@ -179,14 +183,7 @@ export class ConverterService {
       taskState.error = err.message || 'Conversion failed';
       taskState.progress = 0;
 
-      const historyItem = { ...taskState };
-      const existingIdx = this.history.findIndex(h => h.taskId === taskId);
-      if (existingIdx >= 0) {
-        this.history[existingIdx] = historyItem;
-      } else {
-        this.history.unshift(historyItem);
-      }
-
+      const historyItem = this._upsertHistory(taskState);
       this._emitStateChange({ type: 'conversion_failed', taskId, error: taskState.error, task: historyItem });
       throw err;
     }

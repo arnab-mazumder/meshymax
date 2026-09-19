@@ -34,7 +34,7 @@ export function extractTaskId(url) {
 export class NetworkMonitor {
   constructor(options = {}) {
     this.processedTasks = new Set();
-    this.autoConvertEnabled = options.autoConvertEnabled ?? true;
+    this.autoConvertEnabled = options.autoConvertEnabled ?? false;
     this.onModelDetected = options.onModelDetected || null;
     this.debugMode = options.debugMode ?? false;
     this.listeningPage = null;
@@ -71,8 +71,10 @@ export class NetworkMonitor {
 
     await cdpSession.send('Network.enable');
 
-    // Track responses: only store requestId when URL matches
+    // Track responses: only store requestId when URL matches and monitoring is toggled ON
     cdpSession.on('Network.responseReceived', (params) => {
+      if (!this.autoConvertEnabled) return;
+
       const url = params.response?.url;
       if (!url) return;
 

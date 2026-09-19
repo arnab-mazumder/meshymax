@@ -33,7 +33,7 @@ const converterService = new ConverterService({
 await converterService.init();
 
 const networkMonitor = new NetworkMonitor({
-  autoConvertEnabled: true,
+  autoConvertEnabled: false,
   onModelDetected: ({ taskId, url, buffer, sizeBytes }) => {
     broadcastWebSocket({
       type: 'model_detected',
@@ -57,10 +57,12 @@ const browserController = new MeshyBrowserController({
       status: status
     });
   },
-  onScreencastFrame: (base64Image) => {
-    broadcastWebSocket({
-      type: 'screencast_frame',
-      frame: base64Image
+  onScreencastFrame: (frameBuffer) => {
+    // Send as raw binary WebSocket message — no base64 overhead, no JSON parse
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(frameBuffer, { binary: true });
+      }
     });
   }
 });
@@ -92,15 +94,6 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message.toString());
       if (data.type === 'launch_browser') {
         await browserController.launchBrowser();
-      } else if (data.type === 'fresh_session') {
-        broadcastWebSocket({ type: 'fresh_session_progress', message: 'Starting fresh automated session...' });
-        browserController.launchFreshSession((msg, detail) => {
-          broadcastWebSocket({ type: 'fresh_session_progress', message: msg, detail });
-        }).then((session) => {
-          broadcastWebSocket({ type: 'fresh_session_success', email: session.email });
-        }).catch((err) => {
-          broadcastWebSocket({ type: 'fresh_session_error', error: err.message });
-        });
       } else if (data.type === 'reconnect_browser') {
         await browserController.reconnectBrowser();
       } else if (data.type === 'close_browser') {
@@ -120,17 +113,6 @@ wss.on('connection', (ws) => {
 // REST API Endpoints
 
 // 1. Browser Control
-app.post('/api/browser/fresh-session', async (req, res) => {
-  try {
-    const session = await browserController.launchFreshSession((msg, detail) => {
-      broadcastWebSocket({ type: 'fresh_session_progress', message: msg, detail });
-    });
-    res.json({ success: true, email: session.email, status: browserController.getStatus() });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 app.post('/api/browser/launch', async (req, res) => {
   try {
     await browserController.launchBrowser();

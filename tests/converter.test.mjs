@@ -32,3 +32,30 @@ test('converter - passes through standard GLB buffer', async () => {
   assert.equal(result[2], 0x54);
   assert.equal(result[3], 0x46);
 });
+
+test('converter service - processes conversion using worker thread', async () => {
+  const { ConverterService } = await import('../backend/converter-service.js');
+  const service = new ConverterService();
+  await service.init();
+
+  const glbHeader = new Uint8Array([
+    0x67, 0x6c, 0x54, 0x46,
+    0x02, 0x00, 0x00, 0x00,
+    0x1c, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00,
+    0x4e, 0x4f, 0x53, 0x4a,
+    0x7b, 0x7d, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20
+  ]);
+
+  const converted = await service.processConversion('test_worker_task', glbHeader.buffer, 'auto');
+  assert.ok(converted instanceof Buffer || converted instanceof Uint8Array);
+  assert.equal(converted[0], 0x67);
+
+  const stored = service.getConvertedBuffer('test_worker_task');
+  assert.ok(stored);
+  assert.equal(stored.length, converted.length);
+
+  service.removeTask('test_worker_task');
+  assert.equal(service.getConvertedBuffer('test_worker_task'), null);
+});
+

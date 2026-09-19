@@ -1,12 +1,14 @@
 /**
  * Meshy Auto-Converter — Frontend Application
- * WebSocket-driven dashboard for real-time browser status, conversion queue, history, and manual tools.
+ * WebSocket-driven dashboard for real-time browser status, conversion queue, history.
+ * Optimized: no network log rendering, minimal WebSocket traffic, Full Website mode.
  */
 
 // ── WEBSOCKET CONNECTION ──────────────────────────────────────────────────────
 let ws = null;
 let wsReconnectTimer = null;
 let autoConvertEnabled = true;
+let currentViewMode = 'dashboard'; // 'dashboard' | 'full'
 
 function connectWebSocket() {
   const wsUrl = `ws://${location.host}`;
@@ -31,9 +33,7 @@ function connectWebSocket() {
     wsReconnectTimer = setTimeout(connectWebSocket, 3000);
   };
 
-  ws.onerror = (err) => {
-    console.error('[WS] Error:', err);
-  };
+  ws.onerror = () => {};
 }
 
 function sendWsMessage(data) {
@@ -55,32 +55,27 @@ function handleServerEvent(data) {
       updateScreencast(data.frame);
       break;
     case 'model_detected':
-      appendNetworkLog({
-        timestamp: data.timestamp,
-        isMatch: true,
-        method: 'GET',
-        url: `tasks/${data.taskId}/output/model.meshy`,
-        status: 200
-      });
-      showToast(`🔍 Model detected: task ${data.taskId}`, 'info');
+      showToast(`🔍 Model detected: ${data.taskId}`, 'info');
       break;
     case 'conversion_started':
       updateActiveTask(data.task);
+      updateFloatingActive(data.task);
       break;
     case 'conversion_progress':
       updateActiveTask(data.task);
+      updateFloatingActive(data.task);
       break;
     case 'conversion_completed':
       updateActiveTask(data.task);
       addOrUpdateHistory(data.task);
       triggerAutoDownload(data.task.taskId, data.filename);
-      showToast(`✓ ${data.filename} is ready`, 'success');
+      showToast(`✓ ${data.filename} ready`, 'success');
       setTimeout(() => hideActiveTask(), 2000);
       break;
     case 'conversion_failed':
       updateActiveTask(data.task);
       addOrUpdateHistory(data.task);
-      showToast(`✕ Conversion failed for task ${data.taskId}: ${data.error}`, 'error');
+      showToast(`✕ Conversion failed: ${data.error}`, 'error');
       setTimeout(() => hideActiveTask(), 3000);
       break;
     case 'task_removed':
@@ -92,9 +87,16 @@ function handleServerEvent(data) {
     case 'autoconvert_changed':
       autoConvertEnabled = data.enabled;
       document.getElementById('autoconvert-toggle').checked = data.enabled;
+      updateFloatingMonitorStatus();
       break;
-    case 'network_log':
-      appendNetworkLog(data.log);
+    case 'fresh_session_progress':
+      showToast(data.message, 'info', 3500);
+      break;
+    case 'fresh_session_success':
+      showToast(`✓ Meshy authenticated as ${data.email}! Chrome is open and ready.`, 'success', 8000);
+      break;
+    case 'fresh_session_error':
+      showToast(`✕ Fresh session error: ${data.error}`, 'error', 6000);
       break;
     default:
       break;
@@ -105,6 +107,7 @@ function applyInitState(state) {
   updateBrowserStatus(state.status);
   autoConvertEnabled = state.autoConvert ?? true;
   document.getElementById('autoconvert-toggle').checked = autoConvertEnabled;
+  updateFloatingMonitorStatus();
 
   if (state.history && state.history.length > 0) {
     state.history.forEach(task => addOrUpdateHistory(task));
@@ -125,24 +128,13 @@ const STATUS_CLASSES = {
 function updateBrowserStatus(status) {
   const statusClass = STATUS_CLASSES[status] || 'status-waiting';
   const globalEl = document.getElementById('global-status');
-  const browserEl = document.getElementById('browser-state-badge');
   const labelEl = document.getElementById('status-label');
-  const browserLabelEl = document.getElementById('browser-state-label');
 
   globalEl.className = `status-pill ${statusClass}`;
-  browserEl.className = `status-pill ${statusClass}`;
   labelEl.textContent = status;
-  browserLabelEl.textContent = status;
 
   const placeholder = document.getElementById('browser-placeholder');
   const screencastImg = document.getElementById('screencast-img');
-  const hint = document.getElementById('browser-overlay-hint');
-
-  if (status === 'Ready' || status === 'Monitoring') {
-    hint.style.display = 'block';
-  } else {
-    hint.style.display = 'none';
-  }
 
   if (status === 'Disconnected' || status === 'Error') {
     placeholder.style.display = 'flex';
@@ -175,6 +167,58 @@ function updateActiveTask(task) {
 
 function hideActiveTask() {
   document.getElementById('active-task-card').style.display = 'none';
+  // Hide floating active too
+  const fa = document.getElementById('floating-active');
+  if (fa) fa.style.display = 'none';
+}
+
+// ── FLOATING PANEL ────────────────────────────────────────────────────────────
+function updateFloatingActive(task) {
+  const el = document.getElementById('floating-active');
+  if (!el) return;
+  el.style.display = 'block';
+  document.getElementById('floating-task-id').textContent = task.taskId;
+  document.getElementById('floating-progress-bar').style.width = `${task.progress || 0}%`;
+}
+
+function updateFloatingMonitorStatus() {
+  const el = document.getElementById('floating-monitor-status');
+  if (!el) return;
+  const dot = document.getElementById('floating-status-dot');
+  if (autoConvertEnabled) {
+    el.textContent = '● ON';
+    el.style.color = 'var(--status-ready)';
+    if (dot) dot.style.background = 'var(--status-ready)';
+  } else {
+    el.textContent = '● OFF';
+    el.style.color = 'var(--status-error)';
+    if (dot) dot.style.background = 'var(--status-error)';
+  }
+}
+
+function updateFloatingDownloads() {
+  const container = document.getElementById('floating-downloads');
+  if (!container) return;
+  const completed = Array.from(historyData.values()).filter(t => t.status === 'Completed');
+  const badge = document.getElementById('floating-badge');
+  if (badge) badge.textContent = completed.length;
+
+  if (completed.length === 0) {
+    container.innerHTML = '<div style="font-size:11px; color:var(--text-dim); text-align:center;">No downloads yet</div>';
+    return;
+  }
+
+  container.innerHTML = completed.slice(0, 5).map(t => `
+    <div class="floating-download-item">
+      <span class="task-id-tag">${t.filename || t.taskId + '.glb'}</span>
+      <button class="btn btn-sm btn-primary" style="padding:2px 8px; font-size:10px;" onclick="downloadTask('${t.taskId}')">↓</button>
+    </div>
+  `).join('');
+}
+
+function toggleFloatingPanel() {
+  const panel = document.getElementById('floating-panel');
+  panel.classList.toggle('collapsed');
 }
 
 // ── CONVERSION HISTORY ────────────────────────────────────────────────────────
@@ -183,16 +227,19 @@ const historyData = new Map();
 function addOrUpdateHistory(task) {
   historyData.set(task.taskId, task);
   renderHistory();
+  updateFloatingDownloads();
 }
 
 function removeHistoryItem(taskId) {
   historyData.delete(taskId);
   renderHistory();
+  updateFloatingDownloads();
 }
 
 function clearHistoryUI() {
   historyData.clear();
   renderHistory();
+  updateFloatingDownloads();
 }
 
 function formatSize(bytes) {
@@ -228,22 +275,21 @@ function renderHistory() {
   emptyEl.style.display = 'none';
 
   container.innerHTML = tasks.map(task => `
-    <div class="history-item" id="hist-${task.taskId}" style="padding:14px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
-      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+    <div class="history-item" style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
         <div style="flex:1; min-width:0;">
-          <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+          <div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">
             ${statusIcon(task.status)}
-            <span class="task-id-tag" style="font-size:13px;">${task.filename || task.taskId + '.glb'}</span>
+            <span class="task-id-tag" style="font-size:12px;">${task.filename || task.taskId + '.glb'}</span>
           </div>
-          <div style="font-size:11px; color:var(--text-dim);">
+          <div style="font-size:10px; color:var(--text-dim);">
             ${formatTime(task.timestamp)} · ${formatSize(task.sizeBytes)}
             ${task.error ? `<span style="color:var(--status-error);"> · ${task.error}</span>` : ''}
           </div>
         </div>
-        <div style="display:flex; gap:6px; flex-shrink:0;">
-          ${task.status === 'Completed' ? `<button class="btn btn-sm btn-primary" onclick="downloadTask('${task.taskId}')">↓ Download</button>` : ''}
-          ${task.status === 'Failed' ? `<button class="btn btn-sm" onclick="retryTask('${task.taskId}')">↺ Retry</button>` : ''}
-          <button class="btn btn-sm btn-danger" onclick="deleteTask('${task.taskId}')">✕</button>
+        <div style="display:flex; gap:4px; flex-shrink:0;">
+          ${task.status === 'Completed' ? `<button class="btn btn-sm btn-primary" style="padding:2px 8px; font-size:10px;" onclick="downloadTask('${task.taskId}')">↓</button>` : ''}
+          <button class="btn btn-sm" style="padding:2px 6px; font-size:10px;" onclick="deleteTask('${task.taskId}')">✕</button>
         </div>
       </div>
     </div>
@@ -269,10 +315,7 @@ async function deleteTask(taskId) {
   await fetch(`/api/history/${taskId}`, { method: 'DELETE' });
   historyData.delete(taskId);
   renderHistory();
-}
-
-async function retryTask(taskId) {
-  showToast(`↺ Retry not yet supported for manual tasks. Please re-upload.`, 'info');
+  updateFloatingDownloads();
 }
 
 async function clearHistory() {
@@ -281,41 +324,114 @@ async function clearHistory() {
 }
 
 // ── BROWSER CONTROLS ──────────────────────────────────────────────────────────
-async function launchBrowser() {
+function startFreshSession() {
+  showToast('⚡ Starting Fresh Meshy Session via Emailnator…', 'info', 6000);
+  sendWsMessage({ type: 'fresh_session' });
+}
+
+function launchBrowser() {
   showToast('Launching Meshy browser…', 'info');
   sendWsMessage({ type: 'launch_browser' });
 }
 
-async function reconnectBrowser() {
+function reconnectBrowser() {
   showToast('Reconnecting…', 'info');
   sendWsMessage({ type: 'reconnect_browser' });
 }
 
-async function closeBrowser() {
+function closeBrowser() {
   sendWsMessage({ type: 'close_browser' });
 }
 
-// ── BROWSER INTERACTION (click on screencast to forward events) ──────────────
+// ── VIEW MODE ─────────────────────────────────────────────────────────────────
+function setViewMode(mode) {
+  currentViewMode = mode;
+  localStorage.setItem('meshy-view-mode', mode);
+
+  const btnDash = document.getElementById('btn-dashboard');
+  const btnFull = document.getElementById('btn-fullsite');
+
+  if (mode === 'full') {
+    document.body.classList.add('mode-full');
+    btnDash.classList.remove('active');
+    btnFull.classList.add('active');
+  } else {
+    document.body.classList.remove('mode-full');
+    btnDash.classList.add('active');
+    btnFull.classList.remove('active');
+    // Close floating panel
+    document.getElementById('floating-panel').classList.add('collapsed');
+  }
+}
+
+// ── BROWSER INTERACTION (click, drag, orbit, wheel, keyboard) ─────────────────
 document.addEventListener('DOMContentLoaded', () => {
   const screencastImg = document.getElementById('screencast-img');
-  const wrapper = document.getElementById('browser-wrapper');
+  let isMouseDown = false;
+  let lastMoveTime = 0;
 
-  screencastImg.addEventListener('click', (e) => {
+  function getBrowserCoords(e) {
     const rect = screencastImg.getBoundingClientRect();
-    const scaleX = 1280 / rect.width;
-    const scaleY = 800 / rect.height;
-    const x = Math.round((e.clientX - rect.left) * scaleX);
-    const y = Math.round((e.clientY - rect.top) * scaleY);
-    sendWsMessage({ type: 'browser_interact', interaction: { type: 'click', x, y } });
+    const nativeWidth = screencastImg.naturalWidth || 1440;
+    const nativeHeight = screencastImg.naturalHeight || 900;
+    const scaleX = nativeWidth / rect.width;
+    const scaleY = nativeHeight / rect.height;
+    return {
+      x: Math.round((e.clientX - rect.left) * scaleX),
+      y: Math.round((e.clientY - rect.top) * scaleY)
+    };
+  }
+
+  screencastImg.addEventListener('mousedown', (e) => {
+    isMouseDown = true;
+    const { x, y } = getBrowserCoords(e);
+    const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
+    sendWsMessage({ type: 'browser_interact', interaction: { type: 'mousedown', x, y, button } });
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isMouseDown) return;
+    const now = Date.now();
+    if (now - lastMoveTime < 25) return;
+    lastMoveTime = now;
+    const { x, y } = getBrowserCoords(e);
+    sendWsMessage({ type: 'browser_interact', interaction: { type: 'mousemove', x, y } });
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (isMouseDown) {
+      isMouseDown = false;
+      const { x, y } = getBrowserCoords(e);
+      const button = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
+      sendWsMessage({ type: 'browser_interact', interaction: { type: 'mouseup', x, y, button } });
+    }
+  });
+
+  screencastImg.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
   });
 
   screencastImg.addEventListener('wheel', (e) => {
     e.preventDefault();
-    sendWsMessage({ type: 'browser_interact', interaction: { type: 'scroll', deltaY: e.deltaY } });
+    sendWsMessage({
+      type: 'browser_interact',
+      interaction: { type: 'scroll', deltaX: e.deltaX, deltaY: e.deltaY }
+    });
   }, { passive: false });
 
+  // Keyboard forwarding — don't intercept local inputs
   window.addEventListener('keydown', (e) => {
-    if (document.activeElement === document.body && screencastImg.style.display !== 'none') {
+    // Ctrl+Shift+F toggles Full Website mode
+    if (e.ctrlKey && e.shiftKey && e.key === 'F') {
+      e.preventDefault();
+      setViewMode(currentViewMode === 'full' ? 'dashboard' : 'full');
+      return;
+    }
+
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+    if (screencastImg.style.display !== 'none') {
+      if (e.key === 'F5' || (e.ctrlKey && e.key === 'r')) return;
       sendWsMessage({ type: 'browser_interact', interaction: { type: 'keydown', key: e.key } });
     }
   });
@@ -324,16 +440,21 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('autoconvert-toggle').addEventListener('change', function() {
     const enabled = this.checked;
     sendWsMessage({ type: 'set_autoconvert', enabled });
-
-    // Persist in localStorage
     localStorage.setItem('autoConvertEnabled', JSON.stringify(enabled));
+    autoConvertEnabled = enabled;
+    updateFloatingMonitorStatus();
   });
 
-  // Restore auto-convert preference
+  // Restore preferences
   const savedPref = localStorage.getItem('autoConvertEnabled');
   if (savedPref !== null) {
     autoConvertEnabled = JSON.parse(savedPref);
     document.getElementById('autoconvert-toggle').checked = autoConvertEnabled;
+  }
+
+  const savedViewMode = localStorage.getItem('meshy-view-mode');
+  if (savedViewMode) {
+    setViewMode(savedViewMode);
   }
 
   // Button wiring
@@ -343,6 +464,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Start WebSocket
   connectWebSocket();
+
+  // Initialize floating panel state
+  updateFloatingMonitorStatus();
+  updateFloatingDownloads();
 });
 
 // ── MANUAL FILE UPLOAD ────────────────────────────────────────────────────────
@@ -417,8 +542,8 @@ async function convertUrl() {
   }
 
   btn.disabled = true;
-  btn.textContent = '⟳ Fetching…';
-  showToast('Fetching and converting model…', 'info');
+  btn.textContent = '⟳';
+  showToast('Fetching and converting…', 'info');
 
   try {
     const response = await fetch('/api/convert/url', {
@@ -442,43 +567,8 @@ async function convertUrl() {
     showToast(`✕ ${err.message}`, 'error');
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Fetch & Convert';
+    btn.textContent = 'Convert';
   }
-}
-
-// ── NETWORK LOG ───────────────────────────────────────────────────────────────
-const MAX_LOG_ENTRIES = 80;
-const logEl = document.getElementById('network-log');
-
-function appendNetworkLog(entry) {
-  const time = entry.timestamp
-    ? new Date(entry.timestamp).toLocaleTimeString([], { hour12: false })
-    : '--:--:--';
-  const safeUrl = (entry.url || '').slice(0, 80);
-  const method = entry.method || 'GET';
-  const status = entry.status || '';
-
-  const lineEl = document.createElement('div');
-  lineEl.className = `log-entry${entry.isMatch ? ' match' : ''}`;
-  lineEl.innerHTML = `<span class="log-time">${time}</span>${method} ${status} ${safeUrl}${entry.isMatch ? ' <span style="color:#fbbf24;">▲ MATCH</span>' : ''}`;
-  logEl.appendChild(lineEl);
-
-  // Trim older entries
-  const entries = logEl.querySelectorAll('.log-entry');
-  if (entries.length > MAX_LOG_ENTRIES) {
-    entries[0].remove();
-  }
-
-  logEl.scrollTop = logEl.scrollHeight;
-}
-
-function clearLog() {
-  while (logEl.firstChild) logEl.removeChild(logEl.firstChild);
-  const initEntry = document.createElement('div');
-  initEntry.className = 'log-entry';
-  initEntry.style.color = 'var(--text-dim)';
-  initEntry.innerHTML = '<span class="log-time">--:--:--</span> Log cleared.';
-  logEl.appendChild(initEntry);
 }
 
 // ── TOAST NOTIFICATIONS ───────────────────────────────────────────────────────

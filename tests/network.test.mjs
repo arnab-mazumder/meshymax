@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isMeshyModelUrl, extractTaskId } from '../backend/network-monitor.js';
+import { isMeshyModelUrl, extractTaskId, NetworkMonitor } from '../backend/network-monitor.js';
 
 test('network monitor - matches valid meshy model URLs', () => {
   const validUrl1 = 'https://assets.meshy.ai/user_123/tasks/abc123def/output/model.meshy?token=xyz';
@@ -28,4 +28,15 @@ test('network monitor - extracts task ID correctly', () => {
 
   assert.equal(extractTaskId(url1), 'task_abc123');
   assert.equal(extractTaskId(url2), '7af812-999-xyz');
+});
+
+test('network monitor - task processed state tracking', () => {
+  const monitor = new NetworkMonitor();
+
+  assert.equal(monitor.isProcessed('task_1'), false);
+  monitor.markProcessed('task_1');
+  assert.equal(monitor.isProcessed('task_1'), true);
+
+  monitor.clearProcessed();
+  assert.equal(monitor.isProcessed('task_1'), false);
 });

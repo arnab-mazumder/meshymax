@@ -34,7 +34,7 @@ await converterService.init();
 
 const networkMonitor = new NetworkMonitor({
   autoConvertEnabled: true,
-  onModelDetected: async ({ taskId, url, buffer, sizeBytes }) => {
+  onModelDetected: ({ taskId, url, buffer, sizeBytes }) => {
     broadcastWebSocket({
       type: 'model_detected',
       taskId,
@@ -42,16 +42,9 @@ const networkMonitor = new NetworkMonitor({
       timestamp: new Date().toISOString()
     });
 
-    try {
-      await converterService.processConversion(taskId, buffer, 'auto');
-    } catch (err) {
-      console.error(`[Server] Automatic conversion failed for ${taskId}:`, err.message);
-    }
-  },
-  onNetworkLog: (logItem) => {
-    broadcastWebSocket({
-      type: 'network_log',
-      log: logItem
+    // Fire-and-forget: don't await, don't block Playwright
+    converterService.processConversion(taskId, buffer, 'auto').catch(err => {
+      console.error(`[Server] Auto-conversion failed for ${taskId}:`, err.message);
     });
   }
 });
@@ -99,6 +92,15 @@ wss.on('connection', (ws) => {
       const data = JSON.parse(message.toString());
       if (data.type === 'launch_browser') {
         await browserController.launchBrowser();
+      } else if (data.type === 'fresh_session') {
+        broadcastWebSocket({ type: 'fresh_session_progress', message: 'Starting fresh automated session...' });
+        browserController.launchFreshSession((msg, detail) => {
+          broadcastWebSocket({ type: 'fresh_session_progress', message: msg, detail });
+        }).then((session) => {
+          broadcastWebSocket({ type: 'fresh_session_success', email: session.email });
+        }).catch((err) => {
+          broadcastWebSocket({ type: 'fresh_session_error', error: err.message });
+        });
       } else if (data.type === 'reconnect_browser') {
         await browserController.reconnectBrowser();
       } else if (data.type === 'close_browser') {
@@ -118,6 +120,17 @@ wss.on('connection', (ws) => {
 // REST API Endpoints
 
 // 1. Browser Control
+app.post('/api/browser/fresh-session', async (req, res) => {
+  try {
+    const session = await browserController.launchFreshSession((msg, detail) => {
+      broadcastWebSocket({ type: 'fresh_session_progress', message: msg, detail });
+    });
+    res.json({ success: true, email: session.email, status: browserController.getStatus() });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.post('/api/browser/launch', async (req, res) => {
   try {
     await browserController.launchBrowser();

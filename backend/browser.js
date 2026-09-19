@@ -1,6 +1,7 @@
 import { chromium } from 'playwright';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { startFreshMeshySession } from './fresh-session.js';
 
 export class MeshyBrowserController {
   constructor(options = {}) {
@@ -11,7 +12,7 @@ export class MeshyBrowserController {
     this.onStatusChange = options.onStatusChange || null;
     this.onScreencastFrame = options.onScreencastFrame || null;
     this.networkMonitor = options.networkMonitor || null;
-    this.screencastInterval = null;
+    this.cdpSession = null;
     this.targetWorkspaceUrl = 'https://www.meshy.ai/workspace#genMode-img3d';
   }
 
@@ -38,27 +39,33 @@ export class MeshyBrowserController {
     try {
       await fs.mkdir(this.userDataDir, { recursive: true });
 
-      // Determine if a display server is present for headful mode
-      const hasDisplay = process.env.DISPLAY || process.env.WAYLAND_DISPLAY;
-
-      console.log(`[BrowserController] Launching Chromium persistent context (hasDisplay=${!!hasDisplay})...`);
+      const isHeadless = process.env.HEADLESS !== 'false';
+      console.log(`[BrowserController] Launching Chromium persistent context (headless=${isHeadless})...`);
 
       this.context = await chromium.launchPersistentContext(this.userDataDir, {
-        headless: !hasDisplay, // Launches headful window on Desktop Linux if display exists
-        viewport: { width: 1280, height: 800 },
+        headless: isHeadless,
+        viewport: { width: 1440, height: 900 },
         args: [
           '--disable-blink-features=AutomationControlled',
           '--no-sandbox',
-          '--disable-setuid-sandbox'
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage'
         ]
       });
 
       const pages = this.context.pages();
       this.page = pages.length > 0 ? pages[0] : await this.context.newPage();
 
-      // Attach network monitor to intercept model.meshy responses
+      // Create a single CDP session for both screencast and network monitoring
+      this.cdpSession = await this.context.newCDPSession(this.page);
+
+      // Attach network monitor via CDP (zero-overhead URL matching)
       if (this.networkMonitor) {
-        this.networkMonitor.attach(this.page);
+        if (typeof this.networkMonitor.attachCDP === 'function') {
+          await this.networkMonitor.attachCDP(this.cdpSession, this.page);
+        } else {
+          this.networkMonitor.attach(this.page);
+        }
       }
 
       this.page.on('close', () => {
@@ -77,13 +84,13 @@ export class MeshyBrowserController {
       // Check URL and auth state
       await this.checkAuthState();
 
-      // Start live screencast for remote dashboard viewing
-      this.startScreencast();
+      // Start live screencast
+      await this.startScreencast();
 
     } catch (err) {
       console.error('[BrowserController] Error launching browser:', err);
       this.setStatus('Error');
-      this.stopScreencast();
+      await this.stopScreencast();
       throw err;
     }
   }
@@ -97,10 +104,6 @@ export class MeshyBrowserController {
         this.setStatus('Waiting for login');
       } else {
         this.setStatus('Ready');
-        // If logged in, ensure we are on the workspace page
-        if (!url.includes('workspace')) {
-          await this.page.goto(this.targetWorkspaceUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-        }
       }
     } catch (err) {
       console.warn('[BrowserController] Auth state check error:', err.message);
@@ -113,6 +116,13 @@ export class MeshyBrowserController {
     }
 
     try {
+      const currentUrl = this.page.url();
+      // Don't re-navigate if already on Meshy workspace
+      if (currentUrl.includes('meshy.ai/workspace')) {
+        this.setStatus('Ready');
+        return;
+      }
+
       this.setStatus('Meshy loading');
       await this.page.goto(this.targetWorkspaceUrl, { waitUntil: 'domcontentloaded' });
       await this.checkAuthState();
@@ -122,8 +132,53 @@ export class MeshyBrowserController {
     }
   }
 
+  async launchFreshSession(onProgress) {
+    await this.closeBrowser();
+    this.setStatus('Starting fresh session');
+
+    try {
+      const session = await startFreshMeshySession({
+        headless: process.env.HEADLESS === 'true',
+        onProgress: (msg, detail) => {
+          if (onProgress) onProgress(msg, detail);
+        }
+      });
+
+      this.context = session.context;
+      this.page = session.page;
+
+      // Attach CDP session & network monitor
+      try {
+        this.cdpSession = await this.context.newCDPSession(this.page);
+        if (this.networkMonitor) {
+          if (typeof this.networkMonitor.attachCDP === 'function') {
+            await this.networkMonitor.attachCDP(this.cdpSession, this.page);
+          } else {
+            this.networkMonitor.attach(this.page);
+          }
+        }
+      } catch (cdpErr) {
+        console.warn('[BrowserController] Fresh session CDP attach warning:', cdpErr.message);
+      }
+
+      this.page.on('close', () => {
+        console.log('[BrowserController] Fresh session page closed.');
+        this.stopScreencast();
+        this.setStatus('Disconnected');
+      });
+
+      this.setStatus('Ready');
+      await this.startScreencast();
+      return session;
+    } catch (err) {
+      console.error('[BrowserController] Error in launchFreshSession:', err);
+      this.setStatus('Error');
+      throw err;
+    }
+  }
+
   async closeBrowser() {
-    this.stopScreencast();
+    await this.stopScreencast();
     if (this.context) {
       try {
         await this.context.close();
@@ -136,60 +191,82 @@ export class MeshyBrowserController {
     this.setStatus('Disconnected');
   }
 
-  startScreencast() {
-    this.stopScreencast();
+  async startScreencast() {
+    await this.stopScreencast();
 
-    // Stream JPEG screenshots to WebSocket clients (e.g. 5 FPS)
-    this.screencastInterval = setInterval(async () => {
-      if (!this.page || this.page.isClosed()) return;
+    if (!this.cdpSession) {
+      console.warn('[BrowserController] No CDP session available for screencast');
+      return;
+    }
 
-      try {
-        const screenshot = await this.page.screenshot({
-          type: 'jpeg',
-          quality: 60,
-          animations: 'disabled'
-        });
+    try {
+      this.cdpSession.on('Page.screencastFrame', async ({ data, sessionId }) => {
+        try {
+          await this.cdpSession.send('Page.screencastFrameAck', { sessionId });
+        } catch {}
 
         if (this.onScreencastFrame) {
-          this.onScreencastFrame(screenshot.toString('base64'));
+          this.onScreencastFrame(data);
         }
 
-        // Periodically update state
-        const currentUrl = this.page.url();
-        if (currentUrl.includes('workspace') && this.status !== 'Ready' && this.status !== 'Monitoring') {
-          this.setStatus('Ready');
-        }
-      } catch (err) {
-        // Suppress transient screenshot errors (e.g., during navigation)
-      }
-    }, 200);
+        // Lightweight status check
+        try {
+          const currentUrl = this.page ? this.page.url() : '';
+          if (currentUrl.includes('workspace') && this.status !== 'Ready' && this.status !== 'Monitoring') {
+            this.setStatus('Ready');
+          }
+        } catch {}
+      });
+
+      await this.cdpSession.send('Page.startScreencast', {
+        format: 'jpeg',
+        quality: 55,
+        everyNthFrame: 2
+      });
+      console.log('[BrowserController] CDP screencast active.');
+    } catch (err) {
+      console.error('[BrowserController] Screencast failed:', err.message);
+    }
   }
 
-  stopScreencast() {
-    if (this.screencastInterval) {
-      clearInterval(this.screencastInterval);
-      this.screencastInterval = null;
+  async stopScreencast() {
+    if (this.cdpSession) {
+      try {
+        await this.cdpSession.send('Page.stopScreencast').catch(() => {});
+      } catch {}
     }
   }
 
   /**
-   * Forwards remote mouse/keyboard interaction events from the web dashboard
+   * Forwards remote mouse/keyboard/resize interaction events from the web dashboard
    * to the Playwright page.
    */
   async handleUserInteraction(interaction) {
     if (!this.page || this.page.isClosed()) return;
 
     try {
-      const { type, x, y, key, text, deltaY } = interaction;
+      const { type, x, y, button, key, text, deltaX, deltaY, width, height } = interaction;
 
       if (type === 'click') {
-        await this.page.mouse.click(x, y);
+        await this.page.mouse.click(x, y, { button: button || 'left' });
+      } else if (type === 'mousedown') {
+        await this.page.mouse.move(x, y);
+        await this.page.mouse.down({ button: button || 'left' });
+      } else if (type === 'mouseup') {
+        await this.page.mouse.move(x, y);
+        await this.page.mouse.up({ button: button || 'left' });
+      } else if (type === 'mousemove') {
+        await this.page.mouse.move(x, y);
+      } else if (type === 'scroll' || type === 'wheel') {
+        await this.page.mouse.wheel(deltaX || 0, deltaY || 100);
       } else if (type === 'type') {
         await this.page.keyboard.type(text);
       } else if (type === 'keydown') {
         await this.page.keyboard.press(key);
-      } else if (type === 'scroll') {
-        await this.page.mouse.wheel(0, deltaY || 100);
+      } else if (type === 'resize' && width && height) {
+        const clampedW = Math.max(800, Math.min(2560, Math.round(width)));
+        const clampedH = Math.max(600, Math.min(1600, Math.round(height)));
+        await this.page.setViewportSize({ width: clampedW, height: clampedH });
       } else if (type === 'navigate') {
         await this.page.goto(interaction.url || this.targetWorkspaceUrl);
       }

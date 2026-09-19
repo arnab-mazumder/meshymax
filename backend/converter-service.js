@@ -1,13 +1,21 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { convertMeshy } from '../src/converter.js';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'node:worker_threads';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const WORKER_PATH = path.join(__dirname, 'converter-worker.js');
+
+// Auto-expire converted files from RAM after 5 minutes
+const BUFFER_TTL_MS = 5 * 60 * 1000;
 
 export class ConverterService {
   constructor(options = {}) {
     this.history = [];
     this.activeTasks = new Map(); // taskId -> task state object
-    this.convertedFiles = new Map(); // taskId -> Buffer
+    this.convertedFiles = new Map(); // taskId -> { buffer, timer }
     this.onTaskStateChange = options.onTaskStateChange || null;
     this.tempBaseDir = path.join(os.tmpdir(), 'meshy-auto-converter');
   }
@@ -29,18 +37,26 @@ export class ConverterService {
   }
 
   getConvertedBuffer(taskId) {
-    return this.convertedFiles.get(taskId) || null;
+    const entry = this.convertedFiles.get(taskId);
+    return entry ? entry.buffer : null;
   }
 
   removeTask(taskId) {
     this.activeTasks.delete(taskId);
-    this.convertedFiles.delete(taskId);
+    const entry = this.convertedFiles.get(taskId);
+    if (entry) {
+      clearTimeout(entry.timer);
+      this.convertedFiles.delete(taskId);
+    }
     this.history = this.history.filter(t => t.taskId !== taskId);
     this._emitStateChange({ type: 'task_removed', taskId });
   }
 
   clearHistory() {
     this.history = [];
+    for (const [, entry] of this.convertedFiles) {
+      clearTimeout(entry.timer);
+    }
     this.convertedFiles.clear();
     this.activeTasks.clear();
     this._emitStateChange({ type: 'history_cleared' });
@@ -50,6 +66,48 @@ export class ConverterService {
     if (this.onTaskStateChange) {
       this.onTaskStateChange(event);
     }
+  }
+
+  _storeBuffer(taskId, buffer) {
+    // Clear previous timer if re-storing
+    const prev = this.convertedFiles.get(taskId);
+    if (prev) clearTimeout(prev.timer);
+
+    const timer = setTimeout(() => {
+      this.convertedFiles.delete(taskId);
+      console.log(`[ConverterService] Expired buffer for ${taskId} (TTL)`);
+    }, BUFFER_TTL_MS);
+
+    this.convertedFiles.set(taskId, { buffer, timer });
+  }
+
+  /**
+   * Convert in a worker thread to keep main event loop free.
+   * Falls back to main-thread conversion if worker fails to spawn.
+   */
+  _runWorker(rawBuffer) {
+    return new Promise((resolve, reject) => {
+      try {
+        const worker = new Worker(WORKER_PATH, {
+          workerData: { buffer: Buffer.from(rawBuffer) }
+        });
+
+        worker.on('message', (msg) => {
+          if (msg.success) {
+            resolve(Buffer.from(msg.buffer));
+          } else {
+            reject(new Error(msg.error));
+          }
+        });
+
+        worker.on('error', (err) => reject(err));
+        worker.on('exit', (code) => {
+          if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
   /**
@@ -76,38 +134,33 @@ export class ConverterService {
     this.activeTasks.set(taskId, taskState);
     this._emitStateChange({ type: 'conversion_started', task: { ...taskState } });
 
-    const taskTempDir = path.join(this.tempBaseDir, taskId);
-
     try {
-      // Step 1: Downloading / Preparing temp files
-      taskState.status = 'Downloading';
-      taskState.progress = 30;
-      this._emitStateChange({ type: 'conversion_progress', task: { ...taskState } });
-
-      await fs.mkdir(taskTempDir, { recursive: true });
-      const rawFilePath = path.join(taskTempDir, `model.meshy`);
-      await fs.writeFile(rawFilePath, Buffer.from(rawBuffer));
-
-      // Step 2: Parsing & Converting
+      // Step 1: Converting (worker thread)
       taskState.status = 'Converting';
-      taskState.progress = 60;
+      taskState.progress = 40;
       this._emitStateChange({ type: 'conversion_progress', task: { ...taskState } });
 
-      const glbBuffer = await convertMeshy(rawBuffer);
+      let glbBuffer;
+      try {
+        glbBuffer = await this._runWorker(rawBuffer);
+      } catch (workerErr) {
+        // Fallback: main-thread conversion
+        console.warn(`[ConverterService] Worker failed (${workerErr.message}), falling back to main thread`);
+        const { convertMeshy } = await import('../src/converter.js');
+        glbBuffer = await convertMeshy(rawBuffer);
+      }
 
-      // Step 3: Saving output GLB
-      const glbFilePath = path.join(taskTempDir, filename);
-      await fs.writeFile(glbFilePath, glbBuffer);
+      // Release input buffer reference
+      rawBuffer = null;
 
-      // Store converted file buffer in memory map for API download
-      this.convertedFiles.set(taskId, glbBuffer);
+      // Store with TTL
+      this._storeBuffer(taskId, glbBuffer);
 
-      // Finalizing
+      // Finalize
       taskState.status = 'Completed';
       taskState.progress = 100;
       taskState.sizeBytes = glbBuffer.length;
 
-      // Add to history
       const historyItem = { ...taskState };
       const existingIdx = this.history.findIndex(h => h.taskId === taskId);
       if (existingIdx >= 0) {
@@ -117,9 +170,6 @@ export class ConverterService {
       }
 
       this._emitStateChange({ type: 'conversion_completed', task: historyItem, filename });
-
-      // Clean up temp folder asynchronously
-      fs.rm(taskTempDir, { recursive: true, force: true }).catch(() => {});
 
       return glbBuffer;
 
@@ -138,9 +188,6 @@ export class ConverterService {
       }
 
       this._emitStateChange({ type: 'conversion_failed', taskId, error: taskState.error, task: historyItem });
-
-      // Clean up temp folder
-      fs.rm(taskTempDir, { recursive: true, force: true }).catch(() => {});
       throw err;
     }
   }

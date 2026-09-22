@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Meshy to GLB Auto-Converter",
+  "version": "1.0.0",
+  "description": "Automatically intercepts network responses from Meshy AI and converts .meshy models into standard .glb files.",
+  "permissions": [
+    "storage",
+    "downloads",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "*://*.meshy.ai/*",
+    "*://assets.meshy.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Meshy to GLB"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
